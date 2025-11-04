@@ -1,0 +1,89 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Net.Http;
+using System.Threading.Tasks;
+using ExchangeRateUpdater.Config;
+using ExchangeRateUpdater.Models;
+using Microsoft.Extensions.Logging;
+
+namespace ExchangeRateUpdater.Services.RateProviders;
+
+/// <summary>
+///     Retrieves exchange rates from the Czech National Bank's daily CSV file (daily.txt).
+///     Implements <see cref="IExchangeRateProvider" /> to fetch and parse exchange rates in CZK,
+///     normalizing values to a base of 1 unit of the source currency.
+/// </summary>
+public class CzechNationalBankCsvExchangeRateProvider : IExchangeRateProvider
+{
+    private const string DateFormat = "dd MMM yyyy";
+    private readonly IAppConfiguration _appConfiguration;
+    private readonly HttpClient _httpClient;
+    private readonly ILogger<CzechNationalBankCsvExchangeRateProvider> _logger;
+
+    public CzechNationalBankCsvExchangeRateProvider(ILogger<CzechNationalBankCsvExchangeRateProvider> logger,
+        IAppConfiguration appConfiguration, HttpClient httpClient)
+    {
+        _logger = logger;
+        _appConfiguration = appConfiguration;
+        _httpClient = httpClient;
+    }
+
+    public async Task<IEnumerable<ExchangeRate>> GetExchangeRatesAsync(IEnumerable<Currency> currencies)
+    {
+        _logger.LogDebug("Fetching exchange rates from {Url}", _appConfiguration.DailyRateUrl);
+        var response = await _httpClient.GetStringAsync(_appConfiguration.DailyRateUrl);
+
+        var lines = response.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(part => part.Trim())
+            .ToArray();
+
+        var rateDate = GetExtractionDate(lines);
+
+        var currencyCodesToFilter = new HashSet<string>(
+            currencies.Select(c => c.Code),
+            StringComparer.OrdinalIgnoreCase);
+
+        var exchangeRates = new List<ExchangeRate>();
+        // Filter out the first 2 lines as they are headers and date info
+        // Example:
+        // 01 Oct 2025 #191
+        // Country|Currency|Amount|Code|Rate
+        foreach (var line in lines.Skip(2))
+        {
+            _logger.LogDebug("Processing line: {Line}", line);
+
+            var parts = line.Split('|');
+            if (parts.Length != 5) continue;
+
+            var code = parts[3];
+
+            if (!currencyCodesToFilter.Contains(code))
+            {
+                _logger.LogDebug("Currency {Code} is not in the requested list, skipping.", code);
+                continue;
+            }
+
+            var amount = int.Parse(parts[2]);
+            var rate = decimal.Parse(parts[4], CultureInfo.InvariantCulture);
+            var sourceCurrency = new Currency(code);
+            var targetCurrency = new Currency(_appConfiguration.CzkCurrencyCode);
+            var normalizedRate = rate / amount; // Normalize to 1 unit of source currency to avoid amount discrepancies
+
+            var exchangeRate = new ExchangeRate(sourceCurrency, targetCurrency, rateDate, normalizedRate);
+            _logger.LogDebug("Adding exchange rate: {ExchangeRate}", exchangeRate);
+            exchangeRates.Add(exchangeRate);
+        }
+
+        return exchangeRates;
+    }
+
+    private DateOnly GetExtractionDate(string[] lines)
+    {
+        var dateString = lines[0].Split('#')[0].Trim();
+        var rateDate = DateOnly.ParseExact(dateString, DateFormat,
+            CultureInfo.InvariantCulture);
+        return rateDate;
+    }
+}

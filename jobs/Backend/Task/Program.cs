@@ -1,43 +1,80 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
+using System.Threading.Tasks;
+using ExchangeRateUpdater.Config;
+using ExchangeRateUpdater.Data;
+using ExchangeRateUpdater.Services.RateExporters;
+using ExchangeRateUpdater.Services.RateProviders;
+using Microsoft.Extensions.DependencyInjection;
+using Serilog;
+using Serilog.Sinks.SystemConsole.Themes;
 
-namespace ExchangeRateUpdater
+namespace ExchangeRateUpdater;
+
+/// <summary>
+///     Entry point of the application that configures logging, dependency injection,
+///     and orchestrates the exchange rate update process.
+/// </summary>
+public static class Program
 {
-    public static class Program
+    public static async Task Main()
     {
-        private static IEnumerable<Currency> currencies = new[]
+        var config = ConfigurationLoader.Load();
+
+        Log.Logger = new LoggerConfiguration()
+            .MinimumLevel.Is(config.GetLogLevel())
+            .WriteTo.Console(
+                outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff}] [{Level:u}] {Message:lj}{NewLine}{Exception}",
+                theme: AnsiConsoleTheme.Sixteen)
+            .CreateLogger();
+
+        try
         {
-            new Currency("USD"),
-            new Currency("EUR"),
-            new Currency("CZK"),
-            new Currency("JPY"),
-            new Currency("KES"),
-            new Currency("RUB"),
-            new Currency("THB"),
-            new Currency("TRY"),
-            new Currency("XYZ")
-        };
+            config.Validate();
 
-        public static void Main(string[] args)
+            var serviceCollection = new ServiceCollection()
+                .AddLogging(builder => { builder.AddSerilog(Log.Logger); })
+                .AddDbContext<ExchangeRateDbContext>()
+                .AddSingleton<IRepository<ExchangeRateEntity>, Repository<ExchangeRateEntity>>()
+                .AddSingleton(config)
+                .AddHttpClient()
+                .AddSingleton<Application.Application>();
+
+            switch (config.ProviderType)
+            {
+                case RateProviderType.Csv:
+                    serviceCollection.AddSingleton<IExchangeRateProvider, CzechNationalBankCsvExchangeRateProvider>();
+                    break;
+                case RateProviderType.Rest:
+                    serviceCollection
+                        .AddSingleton<IExchangeRateProvider, CzechNationalBankRestApiExchangeRateProvider>();
+                    break;
+                default:
+                    throw new InvalidOperationException($"Unsupported provider type: {config.ProviderType}");
+            }
+
+            switch (config.ExporterType)
+            {
+                case RateExporterType.Console:
+                    serviceCollection.AddSingleton<IExchangeRateExporter, ConsoleExchangeRateExporter>();
+                    break;
+                case RateExporterType.Database:
+                    serviceCollection.AddSingleton<IExchangeRateExporter, DatabaseExchangeRateExporter>();
+                    break;
+                default:
+                    throw new InvalidOperationException($"Unsupported exporter type: {config.ExporterType}");
+            }
+
+            var serviceProvider = serviceCollection.BuildServiceProvider();
+            var app = serviceProvider.GetRequiredService<Application.Application>();
+            await app.RunAsync();
+        }
+        catch (Exception e)
         {
-            try
-            {
-                var provider = new ExchangeRateProvider();
-                var rates = provider.GetExchangeRates(currencies);
-
-                Console.WriteLine($"Successfully retrieved {rates.Count()} exchange rates:");
-                foreach (var rate in rates)
-                {
-                    Console.WriteLine(rate.ToString());
-                }
-            }
-            catch (Exception e)
-            {
-                Console.WriteLine($"Could not retrieve exchange rates: '{e.Message}'.");
-            }
-
-            Console.ReadLine();
+            Log.Fatal(e, "Application terminated unexpectedly");
+        }
+        finally
+        {
+            await Log.CloseAndFlushAsync();
         }
     }
 }
